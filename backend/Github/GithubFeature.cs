@@ -48,7 +48,7 @@ public class GithubFeature : IFeature
         }
 
         services.AddScoped<IModuleSyncService, ModuleSyncService>();
-        services.AddScoped<IGithubUserSettingsRepository, GithubUserSettingsRepository>();
+        services.AddScoped<IGithubOrganizationSettingsRepository, GithubOrganizationSettingsRepository>();
         services.AddScoped<IPushWebhookEventRepository, PushWebhookEventRepository>();
         services.AddScoped<IPullRequestWebhookEventRepository, PullRequestWebhookEventRepository>();
         services.AddScoped<IModuleSyncEventRepository, ModuleSyncEventRepository>();
@@ -63,5 +63,21 @@ public class GithubFeature : IFeature
         var context = scope.ServiceProvider.GetRequiredService<GithubDbContext>();
 
         context.Database.Migrate();
+    }
+
+    void IFeature.AfterAllMigrations(WebApplication app)
+    {
+        using var scope = app.Services.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<GithubDbContext>();
+
+        // Backfill OrganizationId from user's personal org
+        context.Database.ExecuteSqlRaw(@"
+            UPDATE github.""GithubUserSettings"" gs
+            SET ""OrganizationId"" = o.""Id""
+            FROM organizations.""Organizations"" o
+            WHERE o.""OwnerUserId"" = gs.""UserId""
+              AND o.""IsPersonal"" = true
+              AND gs.""OrganizationId"" IS NULL;
+        ");
     }
 }
