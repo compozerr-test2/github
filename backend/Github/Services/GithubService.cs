@@ -6,12 +6,21 @@ using Github.Endpoints.SetDefaultInstallationId;
 using Github.Repositories;
 using Github.Utils;
 using Octokit;
+using Organizations.Data.Repositories;
 using Serilog;
 
 namespace Github.Services;
 
 public record InstallationDto(string InstallationId, string Name, AccountType? AccountType);
 public record RepositoryDto(string OwnedByInstallationId, string Name);
+public record UserRepositoryDto(
+    string InstallationId,
+    string InstallationName,
+    string Owner,
+    string Name,
+    string FullName,
+    bool Private,
+    string? DefaultBranch);
 
 public record GetInstallationClientByUserDefaultResponse(
     IGitHubClient InstallationClient,
@@ -20,6 +29,11 @@ public record GetInstallationClientByUserDefaultResponse(
 
 public record GetInstallationClientByInstallationIdResponse(
     IGitHubClient InstallationClient,
+    string InstallationToken);
+
+public record GetInstallationClientForRepoResponse(
+    IGitHubClient InstallationClient,
+    string InstallationId,
     string InstallationToken);
 
 public interface IGithubService
@@ -35,6 +49,7 @@ public interface IGithubService
     Task<IReadOnlyList<RepositoryDto>> GetRepositoriesByUserDefaultIdAsync(
         UserId userId,
         DefaultInstallationIdSelectionType defaultInstallationIdSelectionType);
+    Task<IReadOnlyList<UserRepositoryDto>> GetAllRepositoriesForUserAsync(UserId userId);
     Task<GithubUserLogin?> GetUserLoginAsync(UserId userId);
     Task<(Repository, Task)> ForkRepositoryAsync(
         IGitHubClient client,
@@ -60,13 +75,15 @@ public interface IGithubService
         CancellationToken cancellationToken = default);
 
     Task<bool> HasAccessToRepositoryAsync(string repoUrl, UserId userId);
+    Task<GetInstallationClientForRepoResponse> GetInstallationClientForRepoAsync(Uri repoUri);
     Task<bool> ValidateTokenAsync(string accessToken);
 }
 
 public sealed class GithubService(
     IGithubJsonWebTokenService jwtService,
     IUserRepository userRepository,
-    IGithubUserSettingsRepository githubUserSettingsRepository) : IGithubService
+    IGithubOrganizationSettingsRepository githubOrganizationSettingsRepository,
+    IOrganizationRepository organizationRepository) : IGithubService
 {
     private readonly Dictionary<string, (string, DateTimeOffset)> _installationTokensCache = [];
 
@@ -227,7 +244,10 @@ public sealed class GithubService(
 
     public async Task<GetInstallationClientByUserDefaultResponse> GetInstallationClientByUserDefaultAsync(UserId userId, DefaultInstallationIdSelectionType type)
     {
-        var userSettings = await githubUserSettingsRepository.GetOrDefaultByUserIdAsync(userId);
+        var personalOrg = await organizationRepository.GetPersonalOrgForUserAsync(userId);
+        var userSettings = personalOrg is not null
+            ? await githubOrganizationSettingsRepository.GetOrDefaultByOrganizationIdAsync(personalOrg.Id)
+            : null;
 
         string? installationId = "";
 
@@ -287,6 +307,49 @@ public sealed class GithubService(
 
             return [];
         }
+    }
+
+    public async Task<IReadOnlyList<UserRepositoryDto>> GetAllRepositoriesForUserAsync(UserId userId)
+    {
+        var installations = await GetInstallationsForUserAsync(userId);
+        var results = new List<UserRepositoryDto>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var installation in installations)
+        {
+            try
+            {
+                var clientResponse = await GetInstallationClientByInstallationIdAsync(installation.InstallationId);
+                if (clientResponse is null) continue;
+
+                var reposResponse = await clientResponse.InstallationClient.GitHubApps.Installation.GetAllRepositoriesForCurrent();
+
+                foreach (var repo in reposResponse.Repositories)
+                {
+                    if (!seen.Add(repo.FullName)) continue;
+                    results.Add(new UserRepositoryDto(
+                        InstallationId: installation.InstallationId,
+                        InstallationName: installation.Name,
+                        Owner: repo.Owner.Login,
+                        Name: repo.Name,
+                        FullName: repo.FullName,
+                        Private: repo.Private,
+                        DefaultBranch: repo.DefaultBranch));
+                }
+            }
+            catch (ForbiddenException ex)
+            {
+                Log.ForContext(nameof(installation.InstallationId), installation.InstallationId)
+                   .Warning(ex, "Installation does not have access to list repositories");
+            }
+            catch (Exception ex)
+            {
+                Log.ForContext(nameof(installation.InstallationId), installation.InstallationId)
+                   .Warning(ex, "Failed to list repositories for installation");
+            }
+        }
+
+        return results;
     }
 
     public async Task<(Repository, Task)> ForkRepositoryAsync(IGitHubClient client, string owner, string repo, string organization, string name)
@@ -465,6 +528,21 @@ public sealed class GithubService(
         }
 
         return false;
+    }
+
+    public async Task<GetInstallationClientForRepoResponse> GetInstallationClientForRepoAsync(Uri repoUri)
+    {
+        var appJwtClient = GetClient();
+        var installationId = await RepoInstallationLookup.LookupInstallationIdAsync(appJwtClient, repoUri);
+
+        var clientResponse = await GetInstallationClientByInstallationIdAsync(installationId.ToString())
+            ?? throw new InvalidOperationException(
+                $"Failed to mint installation token for installation {installationId} (repo: {repoUri})");
+
+        return new GetInstallationClientForRepoResponse(
+            clientResponse.InstallationClient,
+            installationId.ToString(),
+            clientResponse.InstallationToken);
     }
 
     public async Task<bool> ValidateTokenAsync(string accessToken)

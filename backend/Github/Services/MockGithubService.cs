@@ -73,6 +73,15 @@ public sealed class MockGithubService : IGithubService
         return Task.FromResult(repos);
     }
 
+    public Task<IReadOnlyList<UserRepositoryDto>> GetAllRepositoriesForUserAsync(UserId userId)
+    {
+        IReadOnlyList<UserRepositoryDto> repos = new List<UserRepositoryDto>
+        {
+            new("dev-install-1", "dev-user", "dev-user", "sample-repo", "dev-user/sample-repo", false, "main"),
+        };
+        return Task.FromResult(repos);
+    }
+
     public Task<GithubUserLogin?> GetUserLoginAsync(UserId userId)
     {
         return Task.FromResult<GithubUserLogin?>(new GithubUserLogin
@@ -109,6 +118,13 @@ public sealed class MockGithubService : IGithubService
     public Task<bool> HasAccessToRepositoryAsync(string repoUrl, UserId userId)
     {
         return Task.FromResult(true);
+    }
+
+    public Task<GetInstallationClientForRepoResponse> GetInstallationClientForRepoAsync(Uri repoUri)
+    {
+        var client = new GitHubClient(new ProductHeaderValue("compozerr-dev"));
+        var response = new GetInstallationClientForRepoResponse(client, "dev-install-1", "dev-token");
+        return Task.FromResult(response);
     }
 
     public Task<bool> ValidateTokenAsync(string accessToken)
