@@ -10,14 +10,19 @@ namespace Github.Repositories;
 
 public interface IPushWebhookEventRepository : IGenericRepository<PushWebhookEvent, PushWebhookEventId, GithubDbContext>
 {
-    Task<ProjectId?> GetProjectIdFromGitUrlAsync(Uri gitUrl);
+    /// <summary>
+    /// Returns the ids of every project whose repository matches <paramref name="gitUrl"/>.
+    /// A single repo can back multiple projects (e.g. several services in one monorepo),
+    /// so callers must handle zero, one, or many matches.
+    /// </summary>
+    Task<IReadOnlyList<ProjectId>> GetProjectIdsFromGitUrlAsync(Uri gitUrl);
 }
 
 public sealed class PushWebhookEventRepository(
     GithubDbContext context,
     IServiceScopeFactory serviceScopeFactory) : GenericRepository<PushWebhookEvent, PushWebhookEventId, GithubDbContext>(context), IPushWebhookEventRepository
 {
-    public async Task<ProjectId?> GetProjectIdFromGitUrlAsync(Uri gitUrl)
+    public async Task<IReadOnlyList<ProjectId>> GetProjectIdsFromGitUrlAsync(Uri gitUrl)
     {
         // Create a new scope to properly isolate the ApiDbContext from GithubDbContext
         // This prevents memory leaks when used in long-running background jobs
@@ -36,16 +41,7 @@ public sealed class PushWebhookEventRepository(
             : new Uri(urlStr + ".git");
 
         var projects = await projectRepository.GetFilteredAsync(x => x.RepoUri == withoutGit || x.RepoUri == withGit);
-        if (projects.Count > 1)
-        {
-            throw new InvalidOperationException($"Multiple projects found for git URL: {gitUrl}");
-        }
 
-        if (projects.Count == 0)
-        {
-            return null;
-        }
-
-        return projects[0].Id;
+        return projects.Select(p => p.Id).ToList();
     }
 }

@@ -43,8 +43,10 @@ public sealed class PullRequestWebhookProcessorJob(
                 throw new InvalidOperationException("Invalid repository clone URL in PR event.");
             }
 
-            var projectId = await pushWebhookEventRepository.GetProjectIdFromGitUrlAsync(gitUrl);
-            if (projectId is null)
+            // A single repo can back multiple projects (e.g. several services in one
+            // monorepo), so apply the PR action to every matching project.
+            var projectIds = await pushWebhookEventRepository.GetProjectIdsFromGitUrlAsync(gitUrl);
+            if (projectIds.Count == 0)
             {
                 Log.Information(
                     "No project found for git URL {GitUrl} in PullRequestWebhookEvent {EventId}",
@@ -58,25 +60,28 @@ public sealed class PullRequestWebhookProcessorJob(
             var projectRepository = scope.ServiceProvider.GetRequiredService<IProjectRepository>();
             var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
 
-            switch (action)
+            foreach (var projectId in projectIds)
             {
-                case "opened":
-                case "reopened":
-                case "synchronize":
-                    await HandlePrOpenedOrSynchronizeAsync(
-                        prEvent, projectId, environmentRepository, projectRepository, mediator);
-                    break;
+                switch (action)
+                {
+                    case "opened":
+                    case "reopened":
+                    case "synchronize":
+                        await HandlePrOpenedOrSynchronizeAsync(
+                            prEvent, projectId, environmentRepository, projectRepository, mediator);
+                        break;
 
-                case "closed":
-                    await HandlePrClosedAsync(
-                        prEvent, projectId, environmentRepository, mediator);
-                    break;
+                    case "closed":
+                        await HandlePrClosedAsync(
+                            prEvent, projectId, environmentRepository, mediator);
+                        break;
 
-                default:
-                    Log.Information(
-                        "Ignoring PR action {Action} for PullRequestWebhookEvent {EventId}",
-                        action, webhookEvent.Id);
-                    break;
+                    default:
+                        Log.Information(
+                            "Ignoring PR action {Action} for PullRequestWebhookEvent {EventId}",
+                            action, webhookEvent.Id);
+                        break;
+                }
             }
 
             await MarkAsHandledAsync(webhookEvent);

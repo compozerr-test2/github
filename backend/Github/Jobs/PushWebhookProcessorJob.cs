@@ -30,23 +30,29 @@ public sealed class PushWebhookProcessorJob(
     private async Task HandleEventAsync(
         PushWebhookEvent pushWebhookEvent)
     {
+        var log = Log.ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id);
+
         try
         {
-            Log.ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
-               .Information("Processing PushWebhookEvent {PushWebhookEventId}", pushWebhookEvent.Id);
+            log.Information("Processing PushWebhookEvent {PushWebhookEventId}", pushWebhookEvent.Id);
 
             if (Uri.TryCreate(pushWebhookEvent.Event.Repository?.CloneUrl, UriKind.Absolute, out var gitUrl) is false)
             {
                 throw new InvalidOperationException("Invalid repository clone URL.");
             }
 
-            var projectId = await pushWebhookEventRepository.GetProjectIdFromGitUrlAsync(
-                gitUrl) ?? throw new CouldNotFindProjectFromGitUrlException(gitUrl);
+            // A single repo can back multiple projects (e.g. several services in one
+            // monorepo), so fan out: deploy every matching project that has an
+            // environment for the pushed branch with auto-deploy enabled.
+            var projectIds = await pushWebhookEventRepository.GetProjectIdsFromGitUrlAsync(gitUrl);
+            if (projectIds.Count == 0)
+            {
+                throw new CouldNotFindProjectFromGitUrlException(gitUrl);
+            }
 
             if (pushWebhookEvent.Event.HeadCommit is null)
             {
-                Log.ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
-                   .Information("No head commit in PushWebhookEvent {PushWebhookEventId}, skipping (likely branch deletion)",
+                log.Information("No head commit in PushWebhookEvent {PushWebhookEventId}, skipping (likely branch deletion)",
                                 pushWebhookEvent.Id);
                 return;
             }
@@ -61,59 +67,56 @@ public sealed class PushWebhookProcessorJob(
                 throw new InvalidOperationException("Head commit information is incomplete.");
             }
 
-            var deployCommand = new DeployProjectCommand(
-                projectId,
-                CommitHash: pushWebhookEvent.Event.HeadCommit!.Id!,
-                CommitMessage: pushWebhookEvent.Event.HeadCommit!.Message!,
-                CommitAuthor: pushWebhookEvent.Event.HeadCommit!.Author!.Name!,
-                CommitBranch: pushWebhookEvent.Event.Ref.Replace("refs/heads/", string.Empty),
-                CommitEmail: pushWebhookEvent.Event.HeadCommit!.Author!.Email!,
-                OverrideAuthorization: true);
+            var commitMessage = pushWebhookEvent.Event.HeadCommit!.Message!;
+            var branch = pushWebhookEvent.Event.Ref.Replace("refs/heads/", string.Empty);
 
-            if (deployCommand.CommitMessage.Contains("[skip deploy]"))
+            if (commitMessage.Contains("[skip deploy]"))
             {
-                Log.ForContext(nameof(deployCommand), deployCommand)
-                   .ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
-                   .Information("Skipping deployment for commit message '[skip deploy]' in PushWebhookEvent {PushWebhookEventId}",
+                log.Information("Skipping deployment for commit message '[skip deploy]' in PushWebhookEvent {PushWebhookEventId}",
                                 pushWebhookEvent.Id);
-                return;    
-            }
-
-            var projectEnvironment = await projectEnvironmentRepository.GetProjectEnvironmentByBranchAsync(
-                projectId, deployCommand.CommitBranch);
-
-            if (projectEnvironment is null)
-            {
-                Log.ForContext(nameof(deployCommand), deployCommand)
-                   .ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
-                   .Information("No environment found for branch {Branch} on project {ProjectId}, skipping deployment in PushWebhookEvent {PushWebhookEventId}",
-                                deployCommand.CommitBranch, projectId, pushWebhookEvent.Id);
                 return;
             }
 
-            if (projectEnvironment.EffectiveAutoDeploy is false)
+            foreach (var projectId in projectIds)
             {
-                Log.ForContext(nameof(deployCommand), deployCommand)
-                   .ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
-                   .Information("Auto-deploy is disabled for project {ProjectId} on branch {Branch} in PushWebhookEvent {PushWebhookEventId}",
-                                projectId, deployCommand.CommitBranch, pushWebhookEvent.Id);
-                return;
-            }
+                var projectEnvironment = await projectEnvironmentRepository.GetProjectEnvironmentByBranchAsync(
+                    projectId, branch);
 
-            await mediator.Send(deployCommand with { EnvironmentId = projectEnvironment.Id });
+                if (projectEnvironment is null)
+                {
+                    log.Information("No environment found for branch {Branch} on project {ProjectId}, skipping deployment in PushWebhookEvent {PushWebhookEventId}",
+                                    branch, projectId, pushWebhookEvent.Id);
+                    continue;
+                }
+
+                if (projectEnvironment.EffectiveAutoDeploy is false)
+                {
+                    log.Information("Auto-deploy is disabled for project {ProjectId} on branch {Branch} in PushWebhookEvent {PushWebhookEventId}",
+                                    projectId, branch, pushWebhookEvent.Id);
+                    continue;
+                }
+
+                await mediator.Send(new DeployProjectCommand(
+                    projectId,
+                    CommitHash: pushWebhookEvent.Event.HeadCommit!.Id!,
+                    CommitMessage: commitMessage,
+                    CommitAuthor: pushWebhookEvent.Event.HeadCommit!.Author!.Name!,
+                    CommitBranch: branch,
+                    CommitEmail: pushWebhookEvent.Event.HeadCommit!.Author!.Email!,
+                    OverrideAuthorization: true,
+                    EnvironmentId: projectEnvironment.Id));
+            }
         }
         catch (CouldNotFindProjectFromGitUrlException ex)
         {
-            Log.ForContext(nameof(ex), ex)
-               .ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
+            log.ForContext(nameof(ex), ex)
                .Information("Could not find project from Git URL for PushWebhookEvent {PushWebhookEventId}", pushWebhookEvent.Id);
 
             await MarkAsErroredAsync(pushWebhookEvent, ex.Message);
         }
         catch (Exception ex)
         {
-            Log.ForContext(nameof(ex), ex)
-               .ForContext(nameof(pushWebhookEvent), pushWebhookEvent.Id)
+            log.ForContext(nameof(ex), ex)
                .Error("Error processing PushWebhookEvent {PushWebhookEventId}", pushWebhookEvent.Id);
 
             await MarkAsErroredAsync(pushWebhookEvent, ex.Message);
